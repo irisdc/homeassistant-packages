@@ -1,5 +1,5 @@
 # packages/electricity_price_optimisation.yaml
-# Price-driven GoodWe EMS control for a GW10K-ET (10kWh battery) + Solcast solar forecast.
+# Price-driven GoodWe EMS control for a GW10K-ET (10kWh BYD battery) + Solcast solar forecast.
 #
 # DEVICE ID: 32c73405fe89f7c817d30f16c6e2e789 (GoodWe GW10K-ET inverter)
 #
@@ -7,44 +7,51 @@
 #   select.goodwe_inverter_operation_mode — high-level mode (general/eco_charge/eco_discharge...)
 #   select.goodwe_ems_mode                — low-level real-time EMS (auto/battery_standby...)
 #
-#   Charging: goodwe_inverter_operation_mode=eco_charge + number.goodwe_eco_mode_soc=target
-#   Battery idle: goodwe_ems_mode=battery_standby (operation_mode stays general)
-#   Normal: goodwe_inverter_operation_mode=general + goodwe_ems_mode=auto
+#   Charging:      inverter_operation_mode = eco_charge + number.goodwe_eco_mode_soc = target
+#   Battery idle:  inverter_operation_mode = general    + ems_mode = battery_standby
+#   Normal:        inverter_operation_mode = general    + ems_mode = auto
 #
-# EXPORT CONTROL — two entities required:
-#   switch.goodwe_grid_export_limit_switch — on=blocked, off=allowed
-#   number.goodwe_grid_export_limit        — wattage limit (keep at 0W)
-#   006 turns switch ON to block injection at negative prices.
-#   003 and 005 turn switch OFF when returning to normal (unless price still negative).
+# EXPORT CONTROL — writes register 47509 directly via goodwe.set_parameter:
+#   grid_export = 1  → export-limit FEATURE ON  → (with grid_export_limit=0W) export blocked
+#   grid_export = 0  → export-limit FEATURE OFF → full export allowed
+#   PREREQUISITE: number.goodwe_grid_export_limit MUST be 0W (enforced by automation 000).
 #
 # STRATEGY:
-#   | Price signal  | Operation mode | EMS mode        | eco_mode_soc | Export switch |
-#   |---------------|----------------|-----------------|--------------|---------------|
-#   | Negative      | eco_charge     | auto            | 95%          | ON (blocked)  |
-#   | Bottom 25%    | eco_charge     | auto            | 82%          | off (allowed) |
-#   | Middle 25-75% | general        | battery_standby | -            | off (allowed) |
-#   | Top 25%       | general        | auto            | -            | off (allowed) |
-#   | SoC ceiling   | general        | auto            | -            | off if +price |
+#   | Price bucket       | operation_mode | ems_mode        | eco_mode_soc  | grid_export |
+#   |--------------------|----------------|-----------------|---------------|-------------|
+#   | Negative           | eco_charge (*) | auto            | 95%           | 1 (blocked) |
+#   | Bottom 25%, profit | eco_charge     | auto            | dynamic 78–95 | 0 (allowed) |
+#   | Bottom 25%, no edge| general        | battery_standby | —             | 0 (allowed) |
+#   | Middle 25–75%      | general        | battery_standby | —             | 0 (allowed) |
+#   | Top 25%            | general        | auto            | —             | 0 (allowed) |
+#   | SoC ceiling reached| general        | auto            | —             | 0 (unless negative) |
+#   (*) only if SoC < 95% — otherwise just block export, leave battery as-is.
 #
-#   001 and 006 are MUTUALLY EXCLUSIVE:
-#   001 requires market_price_is_negative=off, 006 requires market_price_is_negative=on.
+# PEAK SHAVING:
+#   The solar guard in 001 sums solar only up to the NEXT expensive slot, not over the
+#   full forecast horizon. This prevents tomorrow's midday surplus from wrongly blocking
+#   tonight's cheap charge when an expensive morning peak sits in between.
+#
+# DYNAMIC CHARGE CEILING:
+#   sensor.dynamic_charge_ceiling scales the charge target (0, 78, 82, 90, 95%) to the
+#   price spread between now and the forecast max, after accounting for round-trip
+#   battery efficiency (~90%). Ceiling=0 means "not profitable to charge" — 002 takes
+#   over and preserves the battery in standby. See input_number.battery_rt_efficiency
+#   and input_number.min_profitable_spread_* for tunables.
 #
 # AUTOMATIONS:
-#   001 - Cheap price charging: eco_charge to 82%, solar guard (Solcast half-hourly net)
-#   002 - Battery preservation: battery_standby during middle hours (25-75%)
+#   000 - Enforce grid_export_limit = 0W on HA startup (safety prerequisite)
+#   001 - Cheap price charging: eco_charge to dynamic ceiling, peak-shaving-aware solar guard
+#   002 - Battery preservation: battery_standby during middle hours OR unprofitable cheap hours
 #   003 - Return to normal: general+auto during expensive hours or fallback
 #   004 - Periodic price refresh: polls upstream sensor every 5 minutes
 #   005 - SoC guard: returns to general+auto when eco_charge ceiling hit
-#   006 - Negative price charging: eco_charge to 95%, export blocked
+#   006 - Negative price charging: eco_charge to 95% ONLY if SoC < ceiling (export via 007)
+#   007 - Export sync on negative-price transitions (state-change-driven, no spam)
 
-input_text:
-  battery_soc_entity:
-    name: Battery SoC entity id
-    initial: "sensor.goodwe_battery_state_of_charge"
-  goodwe_param_power_key:
-    name: GoodWe EMS power parameter key
-    initial: ""
-
+# =============================================================================
+# HELPERS
+# =============================================================================
 input_number:
   soc_charge_enable:
     name: SoC charge enable threshold (%)
@@ -53,7 +60,10 @@ input_number:
     max: 100
     step: 1
   soc_charge_disable:
-    name: SoC charge disable threshold (%)
+    # LEGACY: no longer read by automations. The active ceiling comes from
+    # sensor.dynamic_charge_ceiling (or soc_charge_disable_negative during
+    # negative prices). Kept for backwards compatibility; safe to delete.
+    name: SoC charge disable threshold (%) [legacy, unused]
     initial: 82
     min: 0
     max: 100
@@ -70,30 +80,50 @@ input_number:
     min: 0
     max: 100
     step: 1
-  goodwe_charge_power_limit:
-    name: GoodWe charge power limit (W)
-    initial: 3500
-    min: 0
-    max: 3500
-    step: 100
-  goodwe_discharge_power_limit:
-    name: GoodWe discharge power limit (W)
-    initial: 3500
-    min: 0
-    max: 3500
-    step: 100
-  goodwe_param_power_value:
-    name: GoodWe EMS power parameter value (W)
-    initial: 3000
-    min: -10000
-    max: 10000
-    step: 1
+
+  # ---- Dynamic charge ceiling tunables ----
+  battery_rt_efficiency:
+    name: Battery round-trip efficiency (0–1)
+    initial: 0.90
+    min: 0.70
+    max: 1.00
+    step: 0.01
+  min_profitable_spread_eur:
+    name: Min profitable spread above break-even (EUR/kWh)
+    initial: 0.03
+    min: 0.00
+    max: 0.50
+    step: 0.01
+  spread_threshold_80pct:
+    name: Spread threshold for 78% ceiling (EUR/kWh)
+    initial: 0.10
+    min: 0.00
+    max: 0.50
+    step: 0.01
+  spread_threshold_82pct:
+    name: Spread threshold for 82% ceiling (EUR/kWh)
+    initial: 0.20
+    min: 0.00
+    max: 1.00
+    step: 0.01
+  spread_threshold_90pct:
+    name: Spread threshold for 90% ceiling (EUR/kWh)
+    initial: 0.35
+    min: 0.00
+    max: 1.00
+    step: 0.01
 
 input_boolean:
   electricity_price_test:
     name: Electricity price automation test mode
     initial: off
+  export_is_blocked:
+    name: "Export currently blocked (internal flag for dedupe)"
+    initial: off
 
+# =============================================================================
+# TEMPLATE SENSORS
+# =============================================================================
 template:
   - sensor:
       - unique_id: market_price_current_value
@@ -116,14 +146,6 @@ template:
             {% endfor %}
             {{ found.value if found.value is not none else 'unknown' }}
           {% endif %}
-        availability: >-
-          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
-
-      - unique_id: market_price_next_window_list
-        name: "Market price next window list"
-        state: >-
-          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
-          {{ prices | map(attribute='price') | list | join(',') if prices is not none else 'unknown' }}
         availability: >-
           {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
 
@@ -159,6 +181,92 @@ template:
             {% set below = listp | select('lt', curf) | list | length %}
             {% set total = listp | length %}
             {{ ((below / total) * 100) | round(1) }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      # NEW: timestamp of the next expensive (top-25%) slot starting from now.
+      # Returns 'none' if no upcoming expensive slot is present in the forecast window.
+      # Used by 001's peak-shaving-aware solar guard.
+      - unique_id: market_next_expensive_slot_ts
+        name: "Market next expensive slot ts"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {% if prices is none or prices | length == 0 %}
+            none
+          {% else %}
+            {% set arr = prices | map(attribute='price') | list | sort %}
+            {% set n = arr | length %}
+            {% set idx = (n * 0.75) | int %}
+            {% if idx >= n %}{% set idx = n - 1 %}{% endif %}
+            {% set threshold = arr[idx] %}
+            {% set now_ts = as_timestamp(now()) %}
+            {% set ns = namespace(ts=None) %}
+            {% for p in prices %}
+              {% set f = as_timestamp(p['from']) %}
+              {% if f > now_ts and (p['price'] | float) >= (threshold | float) and ns.ts is none %}
+                {% set ns.ts = f %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.ts if ns.ts is not none else 'none' }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      # NEW: net solar forecast between now and the next expensive slot (or to forecast end
+      # if no expensive slot is coming). Used by 001's solar guard.
+      # Consumption assumed at 0.5 kW avg (0.25 kWh per 30-min slot).
+      - unique_id: market_solar_net_before_peak
+        name: "Solar net kwh before next peak"
+        unit_of_measurement: "kWh"
+        state: >-
+          {% set today_fc = state_attr('sensor.solcast_pv_forecast_forecast_today','detailedForecast') or [] %}
+          {% set tomorrow_fc = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow','detailedForecast') or [] %}
+          {% set forecast = today_fc + tomorrow_fc %}
+          {% set now_ts = as_timestamp(now()) %}
+          {% set next_peak = states('sensor.market_next_expensive_slot_ts') %}
+          {% set horizon_ts = (next_peak | float) if next_peak not in ['none','unknown','unavailable',''] else 9999999999 %}
+          {% set consumption_per_slot = 0.25 %}
+          {% set net = namespace(value=0) %}
+          {% for slot in forecast %}
+            {% set ts = as_timestamp(slot.period_start) %}
+            {% if ts >= now_ts and ts < horizon_ts %}
+              {% set net.value = net.value + (slot.pv_estimate | float * 0.5) - consumption_per_slot %}
+            {% endif %}
+          {% endfor %}
+          {{ net.value | round(2) }}
+
+      # NEW: dynamic charge ceiling based on price spread and round-trip efficiency.
+      # Returns the target SoC% for eco_charge, or 0 meaning "don't charge this hour
+      # — not profitable". The break-even spread accounts for round-trip losses:
+      # charge_price × (1/rt_efficiency) must be ≤ peak_price to just break even.
+      # Thresholds above break-even are tunable via input_number helpers.
+      # Consumed by 001 (charge target), 002 (preserve when unprofitable), 005 (ceiling guard).
+      - unique_id: dynamic_charge_ceiling
+        name: "Dynamic charge ceiling"
+        unit_of_measurement: "%"
+        state: >-
+          {% set current = states('sensor.market_price_current_value') | float(999) %}
+          {% set max_price = states('sensor.market_price_max') | float(current) %}
+          {% set rt = states('input_number.battery_rt_efficiency') | float(0.90) %}
+          {% set min_spread = states('input_number.min_profitable_spread_eur') | float(0.03) %}
+          {% set t80 = states('input_number.spread_threshold_80pct') | float(0.10) %}
+          {% set t82 = states('input_number.spread_threshold_82pct') | float(0.20) %}
+          {% set t90 = states('input_number.spread_threshold_90pct') | float(0.35) %}
+          {% set spread = max_price - current %}
+          {# Break-even spread: current × (1/rt − 1). Guard against zero/negative current. #}
+          {% set breakeven = (current * (1 / rt - 1)) if current > 0 else 0.0 %}
+          {% set profitable = spread - breakeven %}
+          {% if profitable < min_spread %}
+            0
+          {% elif profitable < t80 %}
+            78
+          {% elif profitable < t82 %}
+            82
+          {% elif profitable < t90 %}
+            90
+          {% else %}
+            95
           {% endif %}
         availability: >-
           {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
@@ -223,17 +331,49 @@ template:
         availability: >-
           {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
 
+# =============================================================================
+# AUTOMATIONS
+# =============================================================================
 automation:
-  # 001 - Cheap price charging
-  # MUTUALLY EXCLUSIVE with 006: requires market_price_is_negative=off.
-  # Sets inverter_operation_mode=eco_charge with eco_mode_soc=82%.
-  # Solar guard: net solar (today+tomorrow half-hourly) vs headroom * 1.2.
+  # ---------------------------------------------------------------------------
+  # 000 - Safety: enforce grid_export_limit = 0W at HA startup
+  # ---------------------------------------------------------------------------
+  # The grid_export toggle (reg 47509) only blocks export when the wattage limit
+  # (reg 47510) is 0W. If the limit is at 5000W, enabling the feature just caps
+  # at 5kW — it doesn't block. Make sure it's 0 after every HA restart.
+  - id: "electricity_price_startup_000"
+    alias: "000 - GoodWe: enforce export limit = 0W on startup"
+    description: "Safety prerequisite for grid_export toggle to actually block export."
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:30"
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_grid_export_limit
+          value: 0
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: "Startup: grid_export_limit forced to 0W"
+
+  # ---------------------------------------------------------------------------
+  # 001 - Cheap price charging (bottom 25%, not negative)
+  # ---------------------------------------------------------------------------
+  # MUTUALLY EXCLUSIVE with 006: requires market_price_is_negative = off.
+  # Solar guard now uses sensor.market_solar_net_before_peak, which sums solar
+  # only until the NEXT expensive slot (not over the full 48h horizon).
+  # This prevents tomorrow's midday surplus from wrongly blocking tonight's
+  # charge when an expensive morning peak sits in between.
   - id: "electricity_price_charge_001"
     alias: "001 - GoodWe price-based charge control - enable charging"
     description: >
-      Hourly check: bottom 25% price, NOT negative, SoC allows.
-      Sets eco_charge operation mode with eco_mode_soc=soc_charge_disable (82%).
-      Solar guard: net = sum(solar_kwh - 0.25kWh/slot). Blocks if net >= headroom * 1.2.
+      Hourly: bottom 25% price, NOT negative, SoC below enable threshold, spread profitable.
+      Sets eco_charge with eco_mode_soc = sensor.dynamic_charge_ceiling (78–95%).
+      Peak-shaving-aware solar guard: only counts solar before next expensive slot.
+      If ceiling == 0 (not profitable), 002 takes over and preserves the battery in standby.
     mode: single
     trigger:
       - platform: time_pattern
@@ -251,9 +391,14 @@ automation:
         value_template: >-
           {{ states('binary_sensor.market_should_discharge_top_25') != 'on' }}
       - condition: template
+        # Profitability gate: dynamic ceiling returns 0 when the spread doesn't cover
+        # round-trip losses + min margin. Skip charging in that case — 002 will preserve.
         value_template: >-
-          {% set soc_entity = states('input_text.battery_soc_entity') %}
-          {% set soc = states(soc_entity) %}
+          {{ (states('sensor.dynamic_charge_ceiling') | int(0)) > 0
+             or is_state('input_boolean.electricity_price_test','on') }}
+      - condition: template
+        value_template: >-
+          {% set soc = states('sensor.goodwe_battery_state_of_charge') %}
           {% if soc in ['unknown','unavailable',''] %}
             false
           {% else %}
@@ -261,70 +406,64 @@ automation:
                or is_state('input_boolean.electricity_price_test','on') }}
           {% endif %}
       - condition: template
-        # Solar guard: net solar (today+tomorrow half-hourly) vs headroom * 1.2.
-        # Night slots have pv_estimate=0 so they subtract consumption naturally.
-        # Bypassed in test mode.
+        # Peak-shaving-aware solar guard. Bypassed in test mode.
+        # Uses the dynamic ceiling as target: higher ceiling = more headroom to justify,
+        # so a larger solar surplus is needed to block the charge.
         value_template: >-
           {% if is_state('input_boolean.electricity_price_test', 'on') %}
             true
           {% else %}
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
-            {% set target = states('input_number.soc_charge_disable') | float(82) %}
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
+            {% set target = states('sensor.dynamic_charge_ceiling') | float(82) %}
             {% set capacity_kwh = 10.0 %}
             {% set headroom_kwh = ((target - soc) / 100) * capacity_kwh %}
-            {% set consumption_per_slot = 0.25 %}
-            {% set today_fc = state_attr('sensor.solcast_pv_forecast_forecast_today','detailedForecast') or [] %}
-            {% set tomorrow_fc = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow','detailedForecast') or [] %}
-            {% set forecast = today_fc + tomorrow_fc %}
-            {% set now_ts = as_timestamp(now()) %}
-            {% set net = namespace(value=0) %}
-            {% for slot in forecast %}
-              {% if as_timestamp(slot.period_start) >= now_ts %}
-                {% set net.value = net.value + (slot.pv_estimate | float * 0.5) - consumption_per_slot %}
-              {% endif %}
-            {% endfor %}
-            {{ net.value < headroom_kwh * 1.2 }}
+            {% set net = states('sensor.solar_net_kwh_before_next_peak') | float(0) %}
+            {{ net < headroom_kwh * 1.2 }}
           {% endif %}
     action:
       - service: logbook.log
         data:
           name: "electricity_price_optimisation"
           message: >-
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
-            {% set target = states('input_number.soc_charge_disable') | float(82) %}
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
+            {% set target = states('sensor.dynamic_charge_ceiling') | float(82) %}
             {% set headroom_kwh = ((target - soc) / 100) * 10.0 %}
-            {% set consumption_per_slot = 0.25 %}
-            {% set today_fc = state_attr('sensor.solcast_pv_forecast_forecast_today','detailedForecast') or [] %}
-            {% set tomorrow_fc = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow','detailedForecast') or [] %}
-            {% set forecast = today_fc + tomorrow_fc %}
-            {% set now_ts = as_timestamp(now()) %}
-            {% set net = namespace(value=0) %}
-            {% for slot in forecast %}
-              {% if as_timestamp(slot.period_start) >= now_ts %}
-                {% set net.value = net.value + (slot.pv_estimate | float * 0.5) - consumption_per_slot %}
-              {% endif %}
-            {% endfor %}
-            Trigger charge: price low, SoC {{ soc }}%, headroom {{ headroom_kwh | round(1) }}kWh, net solar {{ net.value | round(1) }}kWh, eco_charge to {{ target | int }}%
+            {% set net = states('sensor.solar_net_kwh_before_next_peak') | float(0) %}
+            {% set next_peak = states('sensor.market_next_expensive_slot_ts') %}
+            {% set horizon = 'forecast-end' if next_peak in ['none','unknown','unavailable',''] else next_peak | int | timestamp_local %}
+            {% set cur = states('sensor.market_price_current_value') %}
+            {% set mx = states('sensor.market_price_max') %}
+            Charge enable: SoC {{ soc }}%, target {{ target | int }}%,
+            headroom {{ headroom_kwh | round(1) }}kWh, spread {{ cur }}→{{ mx }},
+            net solar until {{ horizon }}: {{ net | round(1) }}kWh
       - service: number.set_value
         data:
           entity_id: number.goodwe_eco_mode_soc
-          value: "{{ states('input_number.soc_charge_disable') | int }}"
+          value: "{{ states('sensor.dynamic_charge_ceiling') | int }}"
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
           option: "eco_charge"
 
-  # 002 - Battery preservation (battery_standby)
-  # Middle price hours (25-75%): battery completely idle, grid covers house load.
-  # Battery preserved for expensive evening window. Solar still charges battery.
+  # ---------------------------------------------------------------------------
+  # 002 - Battery preservation during middle hours (25–75%)
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # 002 - Battery preservation (middle hours OR cheap-but-unprofitable hours)
+  # ---------------------------------------------------------------------------
+  # battery_standby → battery completely idle, grid covers house load.
+  # Solar still charges battery. Preserves capacity for the expensive window.
+  #
+  # Fires when EITHER:
+  #   (a) price is middle 25–75% (neither cheap nor expensive), OR
+  #   (b) price IS cheap (bottom 25%) BUT dynamic_charge_ceiling == 0
+  #       (arbitrage spread doesn't cover round-trip losses + margin)
+  # Negative prices are excluded (handled by 006).
   - id: "electricity_price_preserve_002"
-    alias: "002 - GoodWe battery preservation - battery_standby during middle hours"
+    alias: "002 - GoodWe battery preservation - battery_standby"
     description: >
-      Hourly check: battery_standby during middle price hours (25-75%).
-      Battery completely idle — grid covers house load.
-      Battery preserved for expensive evening window. Solar still charges.
+      Hourly: middle-priced hours OR cheap hours where charging isn't profitable
+      → general + battery_standby. Preserves battery for the coming expensive window.
     mode: single
     trigger:
       - platform: time_pattern
@@ -333,14 +472,19 @@ automation:
         seconds: "30"
     condition:
       - condition: template
+        # Excludes expensive and negative regardless. Includes middle hours OR
+        # cheap-but-unprofitable hours (dynamic ceiling == 0).
         value_template: >-
-          {{ states('binary_sensor.market_should_charge_bottom_25') != 'on'
-             and states('binary_sensor.market_should_discharge_top_25') != 'on'
-             and states('binary_sensor.market_price_is_negative') != 'on' }}
+          {% set is_cheap = is_state('binary_sensor.market_should_charge_bottom_25','on') %}
+          {% set is_expensive = is_state('binary_sensor.market_should_discharge_top_25','on') %}
+          {% set is_negative = is_state('binary_sensor.market_price_is_negative','on') %}
+          {% set ceiling = states('sensor.dynamic_charge_ceiling') | int(0) %}
+          {% set unprofitable_cheap = is_cheap and ceiling == 0 %}
+          {% set middle = not is_cheap and not is_expensive and not is_negative %}
+          {{ middle or unprofitable_cheap }}
       - condition: template
         value_template: >-
-          {% set soc_entity = states('input_text.battery_soc_entity') %}
-          {% set soc = states(soc_entity) %}
+          {% set soc = states('sensor.goodwe_battery_state_of_charge') %}
           {% if soc in ['unknown','unavailable',''] %}
             false
           {% else %}
@@ -352,10 +496,12 @@ automation:
         data:
           name: "electricity_price_optimisation"
           message: >-
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
             {% set price = states('sensor.market_price_current_value') %}
-            Battery preservation: battery_standby. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+            {% set is_cheap = is_state('binary_sensor.market_should_charge_bottom_25','on') %}
+            {% set ceiling = states('sensor.dynamic_charge_ceiling') | int(0) %}
+            {% set reason = 'cheap-but-unprofitable' if (is_cheap and ceiling == 0) else 'middle-price' %}
+            Preservation ({{ reason }}): battery_standby. Price {{ price }} EUR/kWh, SoC {{ soc }}%
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
@@ -365,14 +511,14 @@ automation:
           entity_id: select.goodwe_ems_mode
           option: "battery_standby"
 
+  # ---------------------------------------------------------------------------
   # 003 - Return to normal (expensive hours or fallback)
-  # Top 25%: general mode + auto EMS, battery naturally covers house load.
-  # Also fallback when price data unavailable.
+  # ---------------------------------------------------------------------------
+  # Top 25% → general + auto, battery naturally discharges to cover house load.
+  # Also fallback when price data is unavailable. Never fires during negative prices.
   - id: "electricity_price_auto_003"
     alias: "003 - GoodWe return to normal - expensive hours or fallback"
-    description: >
-      Hourly check: general+auto when price is top 25% or no price data.
-      Never fires during negative prices.
+    description: "Hourly: top 25% price or no price data → general + auto."
     mode: single
     trigger:
       - platform: time_pattern
@@ -392,10 +538,9 @@ automation:
         data:
           name: "electricity_price_optimisation"
           message: >-
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
             {% set price = states('sensor.market_price_current_value') %}
-            Normal mode: expensive hours or fallback. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+            Normal mode: expensive or fallback. Price {{ price }} EUR/kWh, SoC {{ soc }}%
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
@@ -404,21 +549,13 @@ automation:
         data:
           entity_id: select.goodwe_ems_mode
           option: "auto"
-      - service: goodwe.set_parameter
-        data:
-          device_id: 32c73405fe89f7c817d30f16c6e2e789
-          parameter: grid_export
-          value: 0
-      - service: notify.mobile_app_synology
-        data:
-          message: >-
-            Grid export enabled - price is back to normal ({{ states('sensor.market_price_current_value') }} EUR/kWh)
-          title: "Export Toegestaan"
 
+  # ---------------------------------------------------------------------------
   # 004 - Periodic price refresh
+  # ---------------------------------------------------------------------------
   - id: "electricity_price_refresh_004"
     alias: "004 - GoodWe price decision periodic refresh"
-    description: "Poll the upstream price source every 5 minutes. Template sensors update reactively."
+    description: "Poll the upstream price source every 5 minutes."
     mode: single
     trigger:
       - platform: time_pattern
@@ -429,30 +566,33 @@ automation:
           entity_id:
             - sensor.current_electricity_market_price
 
-  # 005 - SoC guard
-  # Returns to normal when eco_charge ceiling hit mid-session.
-  # Normal ceiling: soc_charge_disable (82%).
-  # Negative price ceiling: soc_charge_disable_negative (95%).
+  # ---------------------------------------------------------------------------
+  # 005 - SoC guard: stop eco_charge at ceiling
+  # ---------------------------------------------------------------------------
+  # Ceiling logic:
+  #   - negative price: soc_charge_disable_negative (95%)
+  #   - positive price: sensor.dynamic_charge_ceiling (78/82/90/95 based on spread)
+  # Returns to general+auto. Does NOT touch export state — that's 007's job.
+  # The `ceiling > 0` guard prevents firing when the dynamic ceiling is 0
+  # (not profitable), since 001 won't have started a charge in that case anyway.
   - id: "electricity_price_soc_guard_005"
     alias: "005 - GoodWe SoC guard - stop charging at ceiling"
     description: >
-      Watches SoC. Returns to general+auto if eco_charge ceiling hit:
-      - normal price: soc_charge_disable (82%)
-      - negative price: soc_charge_disable_negative (95%)
+      Trigger: SoC at or above the active ceiling for 2 min while in eco_charge.
+      Returns to general + auto.
     mode: single
     trigger:
       - platform: template
         value_template: >-
-          {% set soc_entity = states('input_text.battery_soc_entity') %}
-          {% set soc = states(soc_entity) %}
+          {% set soc = states('sensor.goodwe_battery_state_of_charge') %}
           {% set op_mode = states('select.goodwe_inverter_operation_mode') %}
           {% if soc in ['unknown','unavailable',''] %}
             false
           {% else %}
             {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95)
                if is_state('binary_sensor.market_price_is_negative', 'on')
-               else states('input_number.soc_charge_disable') | float(82) %}
-            {{ op_mode == 'eco_charge' and (soc | float) >= ceiling }}
+               else states('sensor.dynamic_charge_ceiling') | float(82) %}
+            {{ op_mode == 'eco_charge' and ceiling > 0 and (soc | float) >= ceiling }}
           {% endif %}
         for: "00:02:00"
     action:
@@ -460,9 +600,11 @@ automation:
         data:
           name: "electricity_price_optimisation"
           message: >-
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
-            SoC guard: eco_charge ceiling reached at {{ soc }}%, returning to general mode
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
+            {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95)
+               if is_state('binary_sensor.market_price_is_negative', 'on')
+               else states('sensor.dynamic_charge_ceiling') | float(82) %}
+            SoC guard: ceiling {{ ceiling | int }}% reached at {{ soc }}%, returning to general+auto
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
@@ -471,32 +613,21 @@ automation:
         data:
           entity_id: select.goodwe_ems_mode
           option: "auto"
-      - choose:
-          - conditions:
-              - condition: state
-                entity_id: binary_sensor.market_price_is_negative
-                state: "off"
-            sequence:
-              - service: goodwe.set_parameter
-                data:
-                  device_id: 32c73405fe89f7c817d30f16c6e2e789
-                  parameter: grid_export
-                  value: 0
-              - service: notify.mobile_app_synology
-                data:
-                  message: "SoC reached charge limit - export enabled"
-                  title: "Export Toegestaan"
 
-# 006 - Negative price charging
-  # MUTUALLY EXCLUSIVE with 001: requires market_price_is_negative=on.
-  # Export is ALWAYS blocked when price is negative, regardless of SoC.
-  # Charging only happens if SoC is below the ceiling (no point charging if full).
+  # ---------------------------------------------------------------------------
+  # 006 - Negative price: charge aggressively (only if not full)
+  # ---------------------------------------------------------------------------
+  # MUTUALLY EXCLUSIVE with 001: requires market_price_is_negative = on.
+  # Export blocking is handled exclusively by 007 (on state transitions).
+  # Here we ONLY command eco_charge IF there's actually headroom — otherwise
+  # the 005-vs-006 thrash pattern kicks in (006 sets eco_charge, 005 reverts,
+  # hourly repeat). If SoC >= ceiling, do nothing; battery stays in whatever
+  # mode 005 last left it.
   - id: "electricity_price_negative_charge_006"
     alias: "006 - GoodWe negative price charging"
     description: >
-      Hourly check: negative price only (mutually exclusive with 001).
-      Always blocks export (grid_export=1). Only sets eco_charge if SoC < 95%.
-      This ensures export stays blocked even if battery is already full.
+      Hourly: negative price + SoC below ceiling → eco_charge to 95%.
+      Export blocking handled by 007 (on price-sign transition, not here).
     mode: single
     trigger:
       - platform: time_pattern
@@ -507,25 +638,25 @@ automation:
       - condition: state
         entity_id: binary_sensor.market_price_is_negative
         state: "on"
+      - condition: template
+        # Only charge if there's meaningful headroom (>2% below ceiling).
+        # Avoids the 006↔005 thrash when battery is already full.
+        value_template: >-
+          {% set soc = states('sensor.goodwe_battery_state_of_charge') %}
+          {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95) %}
+          {% if soc in ['unknown','unavailable',''] %}
+            false
+          {% else %}
+            {{ (soc | float) < (ceiling - 2) }}
+          {% endif %}
     action:
       - service: logbook.log
         data:
           name: "electricity_price_optimisation"
           message: >-
-            {% set soc_entity = states('input_text.battery_soc_entity') %}
-            {% set soc = states(soc_entity) | float(0) %}
+            {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
             {% set price = states('sensor.market_price_current_value') %}
-            {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95) %}
-            Negative price: price {{ price }}, SoC {{ soc }}%, export blocked
-      - service: goodwe.set_parameter
-        data:
-          device_id: 32c73405fe89f7c817d30f16c6e2e789
-          parameter: grid_export
-          value: 1
-      - service: notify.mobile_app_synology
-        data:
-          message: "Grid export blocked due to negative price"
-          title: "Export Geblokkeerd"
+            Negative price + headroom: price {{ price }}, SoC {{ soc }}% → eco_charge 95%
       - service: number.set_value
         data:
           entity_id: number.goodwe_eco_mode_soc
@@ -535,52 +666,81 @@ automation:
           entity_id: select.goodwe_inverter_operation_mode
           option: "eco_charge"
 
-  # 007 - Negative price export control using set_parameter
-  # This automation runs every 5 minutes to catch price changes
-  - id: "export_block_negative_price"
-    alias: "007 - Block grid export at negative prices"
+  # ---------------------------------------------------------------------------
+  # 007 - Export sync on price-sign transitions
+  # ---------------------------------------------------------------------------
+  # Replaces the old periodic 007. Fires only when market_price_is_negative
+  # flips, so no hourly notification spam. Uses input_boolean.export_is_blocked
+  # as dedupe guard — if the desired state already matches, we do nothing.
+  # Also fires at HA startup to resync after restart.
+  - id: "electricity_price_export_sync_007"
+    alias: "007 - Sync grid export with negative price state"
     description: >
-      Uses goodwe.set_parameter with grid_export directly.
-      Turns on export (value=1) when price is negative, off (value=0) when positive.
-      Runs every 30 minutes at :30 to catch price changes.
-    mode: single
+      Trigger on negative-price transitions (and HA start).
+      Blocks export when price goes negative, unblocks when positive.
+      Deduped via input_boolean.export_is_blocked so notifications fire only on actual changes.
+    mode: queued
+    max: 5
     trigger:
-      - platform: time_pattern
-        minutes: "30"
-        seconds: "30"
+      - platform: state
+        entity_id: binary_sensor.market_price_is_negative
+        to: "on"
+        id: "to_negative"
+      - platform: state
+        entity_id: binary_sensor.market_price_is_negative
+        to: "off"
+        id: "to_positive"
+      - platform: homeassistant
+        event: start
+        id: "startup"
     action:
+      - delay: "00:00:10"   # let sensors stabilize, esp. on startup
+      - variables:
+          is_negative: "{{ is_state('binary_sensor.market_price_is_negative', 'on') }}"
+          already_blocked: "{{ is_state('input_boolean.export_is_blocked', 'on') }}"
       - choose:
+          # Should block and isn't blocked yet
           - conditions:
-              - condition: state
-                entity_id: binary_sensor.market_price_is_negative
-                state: "on"
+              - "{{ is_negative and not already_blocked }}"
             sequence:
-              - service: logbook.log
-                data:
-                  name: "electricity_price_optimisation"
-                  message: "Blocking grid export due to negative price"
               - service: goodwe.set_parameter
                 data:
                   device_id: 32c73405fe89f7c817d30f16c6e2e789
                   parameter: grid_export
                   value: 1
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.export_is_blocked
+              - service: logbook.log
+                data:
+                  name: "electricity_price_optimisation"
+                  message: "Export BLOCKED (negative price)"
               - service: notify.mobile_app_synology
                 data:
                   message: >-
-                    Grid export blocked due to negative price ({{ states('sensor.market_price_current_value') }} EUR/kWh)
+                    Grid export blocked due to negative price
+                    ({{ states('sensor.market_price_current_value') }} EUR/kWh)
                   title: "Export Geblokkeerd"
-        default:
-          - service: logbook.log
-            data:
-              name: "electricity_price_optimisation"
-              message: "Enabling grid export - price is positive"
-          - service: goodwe.set_parameter
-            data:
-              device_id: 32c73405fe89f7c817d30f16c6e2e789
-              parameter: grid_export
-              value: 0
-          - service: notify.mobile_app_synology
-            data:
-              message: >-
-                Grid export enabled - price is positive ({{ states('sensor.market_price_current_value') }} EUR/kWh)
-              title: "Export Toegestaan"
+          # Shouldn't block and is currently blocked
+          - conditions:
+              - "{{ not is_negative and already_blocked }}"
+            sequence:
+              - service: goodwe.set_parameter
+                data:
+                  device_id: 32c73405fe89f7c817d30f16c6e2e789
+                  parameter: grid_export
+                  value: 0
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.export_is_blocked
+              - service: logbook.log
+                data:
+                  name: "electricity_price_optimisation"
+                  message: "Export ALLOWED (price back to positive)"
+              - service: notify.mobile_app_synology
+                data:
+                  message: >-
+                    Grid export allowed — price positive
+                    ({{ states('sensor.market_price_current_value') }} EUR/kWh)
+                  title: "Export Toegestaan"
+        # default branch omitted: if state already matches desired, do nothing silently
