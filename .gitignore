@@ -1,0 +1,13 @@
+# Home Assistant secrets
+secrets.yaml
+
+# HA generated files
+*.db
+*.db-shm
+*.db-wal
+home-assistant.log
+home-assistant_v2.db
+
+# Backups
+.backups/
+

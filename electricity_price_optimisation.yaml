@@ -1,0 +1,558 @@
+# packages/electricity_price_optimisation.yaml
+# Price-driven GoodWe EMS control for a GW10K-ET (10kWh battery) + Solcast solar forecast.
+#
+# DEVICE ID: 32c73405fe89f7c817d30f16c6e2e789 (GoodWe GW10K-ET inverter)
+#
+# CONTROL MECHANISM — GW10K-ET has two separate selects:
+#   select.goodwe_inverter_operation_mode — high-level mode (general/eco_charge/eco_discharge...)
+#   select.goodwe_ems_mode                — low-level real-time EMS (auto/battery_standby...)
+#
+#   Charging: goodwe_inverter_operation_mode=eco_charge + number.goodwe_eco_mode_soc=target
+#   Battery idle: goodwe_ems_mode=battery_standby (operation_mode stays general)
+#   Normal: goodwe_inverter_operation_mode=general + goodwe_ems_mode=auto
+#
+# EXPORT CONTROL — two entities required:
+#   switch.goodwe_grid_export_limit_switch — on=blocked, off=allowed
+#   number.goodwe_grid_export_limit        — wattage limit (keep at 0W)
+#   006 turns switch ON to block injection at negative prices.
+#   003 and 005 turn switch OFF when returning to normal (unless price still negative).
+#
+# STRATEGY:
+#   | Price signal  | Operation mode | EMS mode        | eco_mode_soc | Export switch |
+#   |---------------|----------------|-----------------|--------------|---------------|
+#   | Negative      | eco_charge     | auto            | 95%          | ON (blocked)  |
+#   | Bottom 25%    | eco_charge     | auto            | 82%          | off (allowed) |
+#   | Middle 25-75% | general        | battery_standby | -            | off (allowed) |
+#   | Top 25%       | general        | auto            | -            | off (allowed) |
+#   | SoC ceiling   | general        | auto            | -            | off if +price |
+#
+#   001 and 006 are MUTUALLY EXCLUSIVE:
+#   001 requires market_price_is_negative=off, 006 requires market_price_is_negative=on.
+#
+# AUTOMATIONS:
+#   001 - Cheap price charging: eco_charge to 82%, solar guard (Solcast half-hourly net)
+#   002 - Battery preservation: battery_standby during middle hours (25-75%)
+#   003 - Return to normal: general+auto during expensive hours or fallback
+#   004 - Periodic price refresh: polls upstream sensor every 5 minutes
+#   005 - SoC guard: returns to general+auto when eco_charge ceiling hit
+#   006 - Negative price charging: eco_charge to 95%, export blocked
+
+input_text:
+  battery_soc_entity:
+    name: Battery SoC entity id
+    initial: "sensor.goodwe_battery_state_of_charge"
+  goodwe_param_power_key:
+    name: GoodWe EMS power parameter key
+    initial: ""
+
+input_number:
+  soc_charge_enable:
+    name: SoC charge enable threshold (%)
+    initial: 78
+    min: 0
+    max: 100
+    step: 1
+  soc_charge_disable:
+    name: SoC charge disable threshold (%)
+    initial: 82
+    min: 0
+    max: 100
+    step: 1
+  soc_charge_disable_negative:
+    name: SoC charge disable threshold at negative prices (%)
+    initial: 95
+    min: 0
+    max: 100
+    step: 1
+  soc_discharge_disable:
+    name: SoC discharge disable threshold (%)
+    initial: 10
+    min: 0
+    max: 100
+    step: 1
+  goodwe_charge_power_limit:
+    name: GoodWe charge power limit (W)
+    initial: 3500
+    min: 0
+    max: 3500
+    step: 100
+  goodwe_discharge_power_limit:
+    name: GoodWe discharge power limit (W)
+    initial: 3500
+    min: 0
+    max: 3500
+    step: 100
+  goodwe_param_power_value:
+    name: GoodWe EMS power parameter value (W)
+    initial: 3000
+    min: -10000
+    max: 10000
+    step: 1
+
+input_boolean:
+  electricity_price_test:
+    name: Electricity price automation test mode
+    initial: off
+
+template:
+  - sensor:
+      - unique_id: market_price_current_value
+        name: "Market price current value"
+        unit_of_measurement: "EUR/kWh"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {% if prices is none %}
+            unknown
+          {% else %}
+            {% set now_ts = as_timestamp(now()) %}
+            {% set found = namespace(value=None) %}
+            {% for p in prices %}
+              {% set f = as_timestamp(p['from']) %}
+              {% set t = as_timestamp(p['till']) %}
+              {% if now_ts >= f and now_ts < t %}
+                {% set found.value = '%.5f' | format(p['price']) %}
+                {% break %}
+              {% endif %}
+            {% endfor %}
+            {{ found.value if found.value is not none else 'unknown' }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_price_next_window_list
+        name: "Market price next window list"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {{ prices | map(attribute='price') | list | join(',') if prices is not none else 'unknown' }}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_price_min
+        name: "Market price min next window"
+        unit_of_measurement: "EUR/kWh"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {{ (prices | map(attribute='price') | min) | round(5) if prices is not none else 'unknown' }}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_price_max
+        name: "Market price max next window"
+        unit_of_measurement: "EUR/kWh"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {{ (prices | map(attribute='price') | max) | round(5) if prices is not none else 'unknown' }}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_price_percentile_rank
+        name: "Market price percentile rank"
+        unit_of_measurement: "%"
+        state: >-
+          {% set prices = state_attr('sensor.current_electricity_market_price','prices') %}
+          {% set cur = states('sensor.market_price_current_value') %}
+          {% if prices is none or cur in ['unknown','unavailable',''] %}
+            unknown
+          {% else %}
+            {% set listp = prices | map(attribute='price') | list %}
+            {% set curf = cur | float %}
+            {% set below = listp | select('lt', curf) | list | length %}
+            {% set total = listp | length %}
+            {{ ((below / total) * 100) | round(1) }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+  - binary_sensor:
+      - unique_id: market_should_charge
+        name: "Market should charge bottom 25"
+        device_class: power
+        state: >-
+          {% set p = states('sensor.market_price_current_value') %}
+          {% set listp = state_attr('sensor.current_electricity_market_price','prices') %}
+          {% if p in ['unknown','unavailable',''] or listp is none %}
+            off
+          {% else %}
+            {% set arr = listp | map(attribute='price') | list | sort %}
+            {% set n = arr | length %}
+            {% if n == 0 %}
+              off
+            {% else %}
+              {% set idx = (n * 0.25) | int %}
+              {% if idx >= n %}{% set idx = n - 1 %}{% endif %}
+              {% set threshold = arr[idx] %}
+              {{ 'on' if (p | float) <= (threshold | float) else 'off' }}
+            {% endif %}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_should_discharge
+        name: "Market should discharge top 25"
+        device_class: power
+        state: >-
+          {% set p = states('sensor.market_price_current_value') %}
+          {% set listp = state_attr('sensor.current_electricity_market_price','prices') %}
+          {% if p in ['unknown','unavailable',''] or listp is none %}
+            off
+          {% else %}
+            {% set arr = listp | map(attribute='price') | list | sort %}
+            {% set n = arr | length %}
+            {% if n == 0 %}
+              off
+            {% else %}
+              {% set idx = (n * 0.75) | int %}
+              {% if idx >= n %}{% set idx = n - 1 %}{% endif %}
+              {% set threshold = arr[idx] %}
+              {{ 'on' if (p | float) >= (threshold | float) else 'off' }}
+            {% endif %}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+      - unique_id: market_price_is_negative
+        name: "Market price is negative"
+        device_class: power
+        state: >-
+          {% set p = states('sensor.market_price_current_value') %}
+          {% if p in ['unknown','unavailable',''] %}
+            off
+          {% else %}
+            {{ 'on' if (p | float) < 0 else 'off' }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.current_electricity_market_price','prices') is not none }}
+
+automation:
+  # 001 - Cheap price charging
+  # MUTUALLY EXCLUSIVE with 006: requires market_price_is_negative=off.
+  # Sets inverter_operation_mode=eco_charge with eco_mode_soc=82%.
+  # Solar guard: net solar (today+tomorrow half-hourly) vs headroom * 1.2.
+  - id: "electricity_price_charge_001"
+    alias: "001 - GoodWe price-based charge control - enable charging"
+    description: >
+      Hourly check: bottom 25% price, NOT negative, SoC allows.
+      Sets eco_charge operation mode with eco_mode_soc=soc_charge_disable (82%).
+      Solar guard: net = sum(solar_kwh - 0.25kWh/slot). Blocks if net >= headroom * 1.2.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        hours: "/1"
+        minutes: "0"
+        seconds: "30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.market_should_charge_bottom_25
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.market_price_is_negative
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ states('binary_sensor.market_should_discharge_top_25') != 'on' }}
+      - condition: template
+        value_template: >-
+          {% set soc_entity = states('input_text.battery_soc_entity') %}
+          {% set soc = states(soc_entity) %}
+          {% if soc in ['unknown','unavailable',''] %}
+            false
+          {% else %}
+            {{ (soc | float) <= (states('input_number.soc_charge_enable') | float)
+               or is_state('input_boolean.electricity_price_test','on') }}
+          {% endif %}
+      - condition: template
+        # Solar guard: net solar (today+tomorrow half-hourly) vs headroom * 1.2.
+        # Night slots have pv_estimate=0 so they subtract consumption naturally.
+        # Bypassed in test mode.
+        value_template: >-
+          {% if is_state('input_boolean.electricity_price_test', 'on') %}
+            true
+          {% else %}
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            {% set target = states('input_number.soc_charge_disable') | float(82) %}
+            {% set capacity_kwh = 10.0 %}
+            {% set headroom_kwh = ((target - soc) / 100) * capacity_kwh %}
+            {% set consumption_per_slot = 0.25 %}
+            {% set today_fc = state_attr('sensor.solcast_pv_forecast_forecast_today','detailedForecast') or [] %}
+            {% set tomorrow_fc = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow','detailedForecast') or [] %}
+            {% set forecast = today_fc + tomorrow_fc %}
+            {% set now_ts = as_timestamp(now()) %}
+            {% set net = namespace(value=0) %}
+            {% for slot in forecast %}
+              {% if as_timestamp(slot.period_start) >= now_ts %}
+                {% set net.value = net.value + (slot.pv_estimate | float * 0.5) - consumption_per_slot %}
+              {% endif %}
+            {% endfor %}
+            {{ net.value < headroom_kwh * 1.2 }}
+          {% endif %}
+    action:
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: >-
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            {% set target = states('input_number.soc_charge_disable') | float(82) %}
+            {% set headroom_kwh = ((target - soc) / 100) * 10.0 %}
+            {% set consumption_per_slot = 0.25 %}
+            {% set today_fc = state_attr('sensor.solcast_pv_forecast_forecast_today','detailedForecast') or [] %}
+            {% set tomorrow_fc = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow','detailedForecast') or [] %}
+            {% set forecast = today_fc + tomorrow_fc %}
+            {% set now_ts = as_timestamp(now()) %}
+            {% set net = namespace(value=0) %}
+            {% for slot in forecast %}
+              {% if as_timestamp(slot.period_start) >= now_ts %}
+                {% set net.value = net.value + (slot.pv_estimate | float * 0.5) - consumption_per_slot %}
+              {% endif %}
+            {% endfor %}
+            Trigger charge: price low, SoC {{ soc }}%, headroom {{ headroom_kwh | round(1) }}kWh, net solar {{ net.value | round(1) }}kWh, eco_charge to {{ target | int }}%
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_eco_mode_soc
+          value: "{{ states('input_number.soc_charge_disable') | int }}"
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_inverter_operation_mode
+          option: "eco_charge"
+
+  # 002 - Battery preservation (battery_standby)
+  # Middle price hours (25-75%): battery completely idle, grid covers house load.
+  # Battery preserved for expensive evening window. Solar still charges battery.
+  - id: "electricity_price_preserve_002"
+    alias: "002 - GoodWe battery preservation - battery_standby during middle hours"
+    description: >
+      Hourly check: battery_standby during middle price hours (25-75%).
+      Battery completely idle — grid covers house load.
+      Battery preserved for expensive evening window. Solar still charges.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        hours: "/1"
+        minutes: "0"
+        seconds: "30"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('binary_sensor.market_should_charge_bottom_25') != 'on'
+             and states('binary_sensor.market_should_discharge_top_25') != 'on'
+             and states('binary_sensor.market_price_is_negative') != 'on' }}
+      - condition: template
+        value_template: >-
+          {% set soc_entity = states('input_text.battery_soc_entity') %}
+          {% set soc = states(soc_entity) %}
+          {% if soc in ['unknown','unavailable',''] %}
+            false
+          {% else %}
+            {{ (soc | float) > (states('input_number.soc_discharge_disable') | float)
+               or is_state('input_boolean.electricity_price_test','on') }}
+          {% endif %}
+    action:
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: >-
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            {% set price = states('sensor.market_price_current_value') %}
+            Battery preservation: battery_standby. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_inverter_operation_mode
+          option: "general"
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_ems_mode
+          option: "battery_standby"
+
+  # 003 - Return to normal (expensive hours or fallback)
+  # Top 25%: general mode + auto EMS, battery naturally covers house load.
+  # Also fallback when price data unavailable.
+  - id: "electricity_price_auto_003"
+    alias: "003 - GoodWe return to normal - expensive hours or fallback"
+    description: >
+      Hourly check: general+auto when price is top 25% or no price data.
+      Never fires during negative prices.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        hours: "/1"
+        minutes: "0"
+        seconds: "30"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('binary_sensor.market_price_is_negative') != 'on' }}
+      - condition: template
+        value_template: >-
+          {{ states('binary_sensor.market_should_discharge_top_25') == 'on'
+             or states('sensor.market_price_current_value') in ['unknown','unavailable',''] }}
+    action:
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: >-
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            {% set price = states('sensor.market_price_current_value') %}
+            Normal mode: expensive hours or fallback. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_inverter_operation_mode
+          option: "general"
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_ems_mode
+          option: "auto"
+      - service: switch.turn_off
+        data:
+          entity_id: switch.goodwe_grid_export_limit_switch
+
+  # 004 - Periodic price refresh
+  - id: "electricity_price_refresh_004"
+    alias: "004 - GoodWe price decision periodic refresh"
+    description: "Poll the upstream price source every 5 minutes. Template sensors update reactively."
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    action:
+      - service: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.current_electricity_market_price
+
+  # 005 - SoC guard
+  # Returns to normal when eco_charge ceiling hit mid-session.
+  # Normal ceiling: soc_charge_disable (82%).
+  # Negative price ceiling: soc_charge_disable_negative (95%).
+  - id: "electricity_price_soc_guard_005"
+    alias: "005 - GoodWe SoC guard - stop charging at ceiling"
+    description: >
+      Watches SoC. Returns to general+auto if eco_charge ceiling hit:
+      - normal price: soc_charge_disable (82%)
+      - negative price: soc_charge_disable_negative (95%)
+    mode: single
+    trigger:
+      - platform: template
+        value_template: >-
+          {% set soc_entity = states('input_text.battery_soc_entity') %}
+          {% set soc = states(soc_entity) %}
+          {% set op_mode = states('select.goodwe_inverter_operation_mode') %}
+          {% if soc in ['unknown','unavailable',''] %}
+            false
+          {% else %}
+            {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95)
+               if is_state('binary_sensor.market_price_is_negative', 'on')
+               else states('input_number.soc_charge_disable') | float(82) %}
+            {{ op_mode == 'eco_charge' and (soc | float) >= ceiling }}
+          {% endif %}
+        for: "00:02:00"
+    action:
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: >-
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            SoC guard: eco_charge ceiling reached at {{ soc }}%, returning to general mode
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_inverter_operation_mode
+          option: "general"
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_ems_mode
+          option: "auto"
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.market_price_is_negative
+                state: "off"
+            sequence:
+              - service: switch.turn_off
+                data:
+                  entity_id: switch.goodwe_grid_export_limit_switch
+        default: []
+
+  # 006 - Negative price charging
+  # MUTUALLY EXCLUSIVE with 001: requires market_price_is_negative=on.
+  # Export is ALWAYS blocked when price is negative, regardless of SoC.
+  # Charging only happens if SoC is below the ceiling (no point charging if full).
+  - id: "electricity_price_negative_charge_006"
+    alias: "006 - GoodWe negative price charging"
+    description: >
+      Hourly check: negative price only (mutually exclusive with 001).
+      Always blocks export (switch ON). Only sets eco_charge if SoC < 95%.
+      This ensures export stays blocked even if battery is already full.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        hours: "/1"
+        minutes: "0"
+        seconds: "30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.market_price_is_negative
+        state: "on"
+    action:
+      - service: logbook.log
+        data:
+          name: "electricity_price_optimisation"
+          message: >-
+            {% set soc_entity = states('input_text.battery_soc_entity') %}
+            {% set soc = states(soc_entity) | float(0) %}
+            {% set price = states('sensor.market_price_current_value') %}
+            {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95) %}
+            Negative price: price {{ price }} EUR/kWh, SoC {{ soc }}%, export blocked, {% if soc < ceiling %}charging to {{ ceiling | int }}%{% else %}battery full - export blocked only{% endif %}
+      - service: switch.turn_on
+        data:
+          entity_id: switch.goodwe_grid_export_limit_switch
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {% set soc_entity = states('input_text.battery_soc_entity') %}
+                  {% set soc = states(soc_entity) %}
+                  {% if soc in ['unknown','unavailable',''] %}
+                    false
+                  {% else %}
+                    {{ (soc | float) < (states('input_number.soc_charge_disable_negative') | float)
+                       or is_state('input_boolean.electricity_price_test','on') }}
+                  {% endif %}
+            sequence:
+              - service: number.set_value
+                data:
+                  entity_id: number.goodwe_eco_mode_soc
+                  value: "{{ states('input_number.soc_charge_disable_negative') | int }}"
+              - service: select.select_option
+                data:
+                  entity_id: select.goodwe_inverter_operation_mode
+                  option: "eco_charge"
+        default: []
+
+  # 007 - Negative price charging for use with predbat
+  - id: "export_block_negative_price"
+    alias: "007 - Block grid export at negative prices"
+    description: >
+      Independent of Predbat. Turns on export limit switch when price is
+      negative, turns it off when price returns positive.
+      Runs every 5 minutes to catch price changes promptly.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    action:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.market_price_is_negative
+                state: "on"
+            sequence:
+              - service: switch.turn_on
+                data:
+                  entity_id: switch.goodwe_grid_export_limit_switch
+        default:
+          - service: switch.turn_off
+            data:
+              entity_id: switch.goodwe_grid_export_limit_switch

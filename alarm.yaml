@@ -1,0 +1,169 @@
+# ============================================================
+# alarm.yaml — Home Alarm Package
+# ============================================================
+#
+#
+#   terrace     Frigate camera name for camera 1
+#                     (as configured in frigate config, e.g. terrace)
+#   back_garden     Frigate camera name for camera 2
+#                     (e.g. back_garden)
+#
+#   terras      rroller/dahua entity slug for camera 1 illuminator
+#                     Check in Settings → Entities, search "illuminator"
+#                     e.g. if entity is switch.terrace_illuminator → slug is terrace
+#   tuinhuis      Same for camera 2
+#
+#   notify.mobile_app_synology  ✓ notify service configured for iPhone Iris
+#
+#   http://192.168.0.125:8123   HA address reachable by the Onkyo on your LAN
+#
+#
+# ============================================================
+
+alarm_control_panel:
+  - platform: manual
+    name: Home Alarm
+    unique_id: home_alarm_panel
+    arming_time: 45 # seconds to leave the house after arming
+    delay_time: 30 # entry grace period before triggering
+    trigger_time: 600 # how long the alarm stays in triggered state
+    disarmed:
+      trigger_time: 0 # no accidental triggers in disarmed state
+    armed_home:
+      arming_time: 0 # no exit delay when staying home
+      delay_time: 10 # short entry grace when armed_home
+
+automation:
+  # ── ARM: enable Frigate detection + recording ──────────────────────────────
+  - id: alarm_on_arm
+    alias: "Alarm | Enable Frigate detection on arm"
+    description: "Turns on person detection and recording when alarm is armed"
+    trigger:
+      - platform: state
+        entity_id: alarm_control_panel.home_alarm
+        to:
+          - armed_away
+          - armed_home
+    action:
+      - action: switch.turn_on
+        target:
+          entity_id:
+            - switch.terrace_detect # frigate integration (not dahua!)
+            - switch.terrace_motion
+            - switch.back_garden_detect
+            - switch.back_garden_motion
+      - action: switch.turn_on
+        target:
+          entity_id:
+            - switch.terrace_recordings
+            - switch.back_garden_recordings
+
+  # ── DISARM: disable detection + stop all alarm responses ──────────────────
+  - id: alarm_on_disarm
+    alias: "Alarm | Disable Frigate detection and stop alarm on disarm"
+    trigger:
+      - platform: state
+        entity_id: alarm_control_panel.home_alarm
+        to: disarmed
+    action:
+      - action: switch.turn_off
+        target:
+          entity_id:
+            - switch.terrace_detect # frigate integration (not dahua!)
+            - switch.terrace_motion
+            - switch.back_garden_detect
+            - switch.back_garden_motion
+      - action: switch.turn_off
+        target:
+          entity_id:
+            - switch.terrace_recordings
+            - switch.back_garden_recordings
+      - action: switch.turn_off
+        target:
+          entity_id:
+            - light.terras_illuminator
+            - light.tuinhuis_illuminator
+
+  # ── TRIGGER: person detected by Frigate (any armed camera) ────────────────
+  # MQTT is actually better for this alarm use case because of the event_id based
+  # snapshot and the single-trigger-all-cameras pattern. The integration sensors
+  # are better for dashboards and simple condition checks.
+  - id: alarm_person_detected
+    alias: "Alarm | Person detected — trigger alarm response"
+    description: >
+      Listens to Frigate MQTT events. Triggers the alarm panel, fires
+      the illuminator for the camera that detected, plays the alarm sound
+      on both Onkyos, and sends an iPhone critical alert with the snapshot.
+    mode: single # do not re-trigger while already processing
+    max_exceeded: silent
+    trigger:
+      - platform: mqtt
+        topic: "frigate/events"
+    condition:
+      # only act on new detections (not updates or deletions)
+      - condition: template
+        value_template: "{{ trigger.payload_json['type'] == 'new' }}"
+      # only for person detections
+      - condition: template
+        value_template: "{{ trigger.payload_json['after']['label'] == 'person' }}"
+      # only for our armed cameras
+      - condition: template
+        value_template: >
+          {{ trigger.payload_json['after']['camera'] in [
+               'terrace',
+               'back_garden'
+             ] }}
+      # only when the alarm is armed
+      - condition: state
+        entity_id: alarm_control_panel.home_alarm
+        state:
+          - armed_away
+          - armed_home
+    variables:
+      camera: "{{ trigger.payload_json['after']['camera'] }}"
+      event_id: "{{ trigger.payload_json['after']['id'] }}"
+    action:
+      # 1. Put the alarm panel in triggered state
+      - action: alarm_control_panel.alarm_trigger
+        target:
+          entity_id: alarm_control_panel.home_alarm
+
+      # 2. Flash the illuminator of the camera that detected
+      #    Relies on DAHUA slug matching CAMERA slug — adjust the map below if they differ
+      - variables:
+          illuminator_map:
+            terrace: light.terras_illuminator
+            back_garden: light.tuinhuis_illuminator
+      - action: switch.turn_on
+        target:
+          entity_id: "{{ illuminator_map[camera] }}"
+
+      # 3. Set Onkyo volume and play alarm MP3
+      #    The MP3 must be at config/www/alarm.mp3
+      - action: media_player.volume_set
+        target:
+          entity_id:
+            - media_player.tx_nr676e
+        data:
+          volume_level: 1.0
+      - action: media_player.play_media
+        target:
+          entity_id:
+            - media_player.tx_nr676e
+        data:
+          media_content_id: "jeremayjimenez-eas-alarm-iphone-alarm-262882.mp3"
+          media_content_type: music
+
+      # 4. Send critical iPhone push notification with Frigate snapshot
+      - action: notify.mobile_app_synology
+        data:
+          title: "Alarm triggered — {{ camera }}"
+          message: "Person detected"
+          data:
+            image: "http://192.168.0.125:8123/api/frigate/notifications/{{ event_id }}/snapshot.jpg"
+            url: "http://192.168.0.125:8123/lovelace/alarm" # deep-link into HA app; set to your alarm dashboard URL
+            push:
+              sound:
+                name: default
+                critical: 1 # bypasses silent mode
+                volume: 1.0

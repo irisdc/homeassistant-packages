@@ -1,0 +1,52 @@
+##############################################
+#  GAS COST TRACKING – FRANK ENERGIE (BE)
+#  Voor Iris – Fluvius Zenne-Dijle
+##############################################
+
+utility_meter:
+  gas_daily:
+    source: sensor.gas_consumed_belgium
+    cycle: daily
+
+input_number:
+  frank_gasprijs:
+    name: "Frank gasprijs €/kWh"
+    min: 0
+    max: 1
+    step: 0.0001
+    unit_of_measurement: "€/kWh"
+    icon: mdi:currency-eur
+
+  frank_vaste_kost_per_dag:
+    name: "Frank vaste kost per dag"
+    min: 0
+    max: 1
+    step: 0.0001
+    unit_of_measurement: "€"
+    icon: mdi:calendar
+
+template:
+  - sensor:
+      - name: "Gas dagkost"
+        unit_of_measurement: "€"
+        icon: mdi:cash
+        state: >
+          {% set verbruik = states('sensor.gas_daily') | float(0) %}
+          {% set prijs = states('input_number.frank_gasprijs') | float(0) %}
+          {% set vaste = states('input_number.frank_vaste_kost_per_dag') | float(0) %}
+          {{ (verbruik * prijs + vaste) | round(2) }}
+
+automation:
+  - alias: "Herinnering gasprijs Frank updaten"
+    id: herinnering_gasprijs_frank
+    trigger:
+      - platform: time
+        at: "09:00:00"
+    condition:
+      - condition: template
+        value_template: "{{ now().day == 1 }}"
+    action:
+      - service: notify.mobile_app_iris
+        data:
+          title: "Gasprijs updaten"
+          message: "Nieuwe maand → update je Frank gasprijs in het Energy Dashboard."

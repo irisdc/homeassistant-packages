@@ -1,0 +1,99 @@
+# packages/predbat_helpers.yaml
+# Input helpers required by Predbat for GoodWe GW10K-ET.
+#
+# WHY input_select FOR TIME WINDOWS:
+# Predbat requires charge_start_time / charge_end_time entities to be set even
+# with has_charge_enable_time: false, or it crashes. input_text is rejected by
+# Predbat validation ("cannot be modified"). input_select IS writable by Predbat.
+#
+# These selects hold HH:MM time strings that Predbat reads and writes to track
+# its planned charge/discharge windows internally. The GoodWe inverter itself
+# is NOT controlled by these values — actual control happens via service calls
+# (eco_charge / general operation modes) configured in apps.yaml.
+#
+# The options list covers every 30-minute slot in a 24-hour day.
+
+input_number:
+  # Reserve/floor for Predbat.
+  # Predbat will never plan to discharge the battery below this level.
+  # Set to 10% to match number.goodwe_depth_of_discharge_on_grid (currently 91,
+  # meaning the inverter itself won't go below 9%).
+  predbat_reserve:
+    name: Predbat battery reserve (%)
+    initial: 10
+    min: 0
+    max: 100
+    step: 1
+
+input_select:
+  predbat_charge_start_time:
+    name: Predbat charge start time
+    options: &time_slots
+      - "00:00"
+      - "00:30"
+      - "01:00"
+      - "01:30"
+      - "02:00"
+      - "02:30"
+      - "03:00"
+      - "03:30"
+      - "04:00"
+      - "04:30"
+      - "05:00"
+      - "05:30"
+      - "06:00"
+      - "06:30"
+      - "07:00"
+      - "07:30"
+      - "08:00"
+      - "08:30"
+      - "09:00"
+      - "09:30"
+      - "10:00"
+      - "10:30"
+      - "11:00"
+      - "11:30"
+      - "12:00"
+      - "12:30"
+      - "13:00"
+      - "13:30"
+      - "14:00"
+      - "14:30"
+      - "15:00"
+      - "15:30"
+      - "16:00"
+      - "16:30"
+      - "17:00"
+      - "17:30"
+      - "18:00"
+      - "18:30"
+      - "19:00"
+      - "19:30"
+      - "20:00"
+      - "20:30"
+      - "21:00"
+      - "21:30"
+      - "22:00"
+      - "22:30"
+      - "23:00"
+      - "23:30"
+    initial: "00:00"
+    icon: mdi:clock-start
+
+  predbat_charge_end_time:
+    name: Predbat charge end time
+    options: *time_slots
+    initial: "00:00"
+    icon: mdi:clock-end
+
+  predbat_discharge_start_time:
+    name: Predbat discharge start time
+    options: *time_slots
+    initial: "00:00"
+    icon: mdi:clock-start
+
+  predbat_discharge_end_time:
+    name: Predbat discharge end time
+    options: *time_slots
+    initial: "00:00"
+    icon: mdi:clock-end

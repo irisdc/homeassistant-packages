@@ -1,0 +1,90 @@
+# ============================================================
+# EMHASS Package
+# Energy Management and Home Automation Optimization System
+# ============================================================
+
+template:
+  - sensor:
+      - name: "EMHASS PV Forecast"
+        unique_id: emhass_pv_forecast
+        state: "OK"
+        attributes:
+          forecast: >
+            {% set today = state_attr('sensor.solcast_pv_forecast_forecast_today', 'detailedForecast') %}
+            {% set tomorrow = state_attr('sensor.solcast_pv_forecast_forecast_tomorrow', 'detailedForecast') %}
+            {% set combined = today + tomorrow %}
+            {% set ns = namespace(result=[]) %}
+            {% for slot in combined %}
+              {% set ns.result = ns.result + [(slot.pv_estimate * 1000) | int] %}
+            {% endfor %}
+            {{ ns.result }}
+
+      - name: "EMHASS Load Cost Forecast"
+        unique_id: emhass_load_cost_forecast
+        state: "OK"
+        attributes:
+          forecast: >
+            {% set prices = state_attr('sensor.current_electricity_price_all_in', 'prices') %}
+            {% set ns = namespace(result=[]) %}
+            {% for slot in prices %}
+              {% set ns.result = ns.result + [slot.price | float | round(4), slot.price | float | round(4)] %}
+            {% endfor %}
+            {{ ns.result }}
+
+      - name: "EMHASS Prod Price Forecast"
+        unique_id: emhass_prod_price_forecast
+        state: "OK"
+        attributes:
+          forecast: >
+            {% set prices = state_attr('sensor.current_electricity_price_including_tax', 'prices') %}
+            {% set ns = namespace(result=[]) %}
+            {% for slot in prices %}
+              {% set ns.result = ns.result + [slot.price | float | round(4), slot.price | float | round(4)] %}
+            {% endfor %}
+            {{ ns.result }}
+
+rest_command:
+  emhass_dayahead:
+    url: http://localhost:5050/action/dayahead-optim
+    method: POST
+    content_type: "application/json"
+    payload: >
+      {"pv_power_forecast": {{ state_attr('sensor.emhass_pv_forecast', 'forecast') }},
+       "load_cost_forecast": {{ state_attr('sensor.emhass_load_cost_forecast', 'forecast') }},
+       "prod_price_forecast": {{ state_attr('sensor.emhass_prod_price_forecast', 'forecast') }}
+      }
+
+  emhass_mpc:
+    url: http://localhost:5050/action/naive-mpc-optim
+    method: POST
+    content_type: "application/json"
+    payload: >
+      {"pv_power_forecast": {{ state_attr('sensor.emhass_pv_forecast', 'forecast') }},
+       "load_cost_forecast": {{ state_attr('sensor.emhass_load_cost_forecast', 'forecast') }},
+       "prod_price_forecast": {{ state_attr('sensor.emhass_prod_price_forecast', 'forecast') }}
+      }
+
+  emhass_publish:
+    url: http://localhost:5050/action/publish-data
+    method: POST
+    content_type: "application/json"
+    payload: "{}"
+
+automation:
+  - alias: "EMHASS Day-ahead Optimization"
+    id: emhass_dayahead_optim
+    trigger:
+      - platform: time
+        at: "05:30:00"
+    action:
+      - service: rest_command.emhass_dayahead
+
+  - alias: "EMHASS MPC Optimization"
+    id: emhass_mpc_optim
+    trigger:
+      - platform: time_pattern
+        minutes: "/30"
+    action:
+      - service: rest_command.emhass_mpc
+      - delay: "00:00:10"
+      - service: rest_command.emhass_publish
