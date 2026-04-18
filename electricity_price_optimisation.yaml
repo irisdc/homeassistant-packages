@@ -404,9 +404,16 @@ automation:
         data:
           entity_id: select.goodwe_ems_mode
           option: "auto"
-      - service: switch.turn_off
+      - service: goodwe.set_parameter
         data:
-          entity_id: switch.goodwe_grid_export_limit_switch
+          device_id: 32c73405fe89f7c817d30f16c6e2e789
+          parameter: grid_export
+          value: 0
+      - service: notify.mobile_app_synology
+        data:
+          message: >-
+            Grid export enabled - price is back to normal ({{ states('sensor.market_price_current_value') }} EUR/kWh)
+          title: "Export Toegestaan"
 
   # 004 - Periodic price refresh
   - id: "electricity_price_refresh_004"
@@ -470,12 +477,17 @@ automation:
                 entity_id: binary_sensor.market_price_is_negative
                 state: "off"
             sequence:
-              - service: switch.turn_off
+              - service: goodwe.set_parameter
                 data:
-                  entity_id: switch.goodwe_grid_export_limit_switch
-        default: []
+                  device_id: 32c73405fe89f7c817d30f16c6e2e789
+                  parameter: grid_export
+                  value: 0
+              - service: notify.mobile_app_synology
+                data:
+                  message: "SoC reached charge limit - export enabled"
+                  title: "Export Toegestaan"
 
-  # 006 - Negative price charging
+# 006 - Negative price charging
   # MUTUALLY EXCLUSIVE with 001: requires market_price_is_negative=on.
   # Export is ALWAYS blocked when price is negative, regardless of SoC.
   # Charging only happens if SoC is below the ceiling (no point charging if full).
@@ -483,7 +495,7 @@ automation:
     alias: "006 - GoodWe negative price charging"
     description: >
       Hourly check: negative price only (mutually exclusive with 001).
-      Always blocks export (switch ON). Only sets eco_charge if SoC < 95%.
+      Always blocks export (grid_export=1). Only sets eco_charge if SoC < 95%.
       This ensures export stays blocked even if battery is already full.
     mode: single
     trigger:
@@ -504,44 +516,38 @@ automation:
             {% set soc = states(soc_entity) | float(0) %}
             {% set price = states('sensor.market_price_current_value') %}
             {% set ceiling = states('input_number.soc_charge_disable_negative') | float(95) %}
-            Negative price: price {{ price }} EUR/kWh, SoC {{ soc }}%, export blocked, {% if soc < ceiling %}charging to {{ ceiling | int }}%{% else %}battery full - export blocked only{% endif %}
-      - service: switch.turn_on
+            Negative price: price {{ price }}, SoC {{ soc }}%, export blocked
+      - service: goodwe.set_parameter
         data:
-          entity_id: switch.goodwe_grid_export_limit_switch
-      - choose:
-          - conditions:
-              - condition: template
-                value_template: >-
-                  {% set soc_entity = states('input_text.battery_soc_entity') %}
-                  {% set soc = states(soc_entity) %}
-                  {% if soc in ['unknown','unavailable',''] %}
-                    false
-                  {% else %}
-                    {{ (soc | float) < (states('input_number.soc_charge_disable_negative') | float)
-                       or is_state('input_boolean.electricity_price_test','on') }}
-                  {% endif %}
-            sequence:
-              - service: number.set_value
-                data:
-                  entity_id: number.goodwe_eco_mode_soc
-                  value: "{{ states('input_number.soc_charge_disable_negative') | int }}"
-              - service: select.select_option
-                data:
-                  entity_id: select.goodwe_inverter_operation_mode
-                  option: "eco_charge"
-        default: []
+          device_id: 32c73405fe89f7c817d30f16c6e2e789
+          parameter: grid_export
+          value: 1
+      - service: notify.mobile_app_synology
+        data:
+          message: "Grid export blocked due to negative price"
+          title: "Export Geblokkeerd"
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_eco_mode_soc
+          value: "{{ states('input_number.soc_charge_disable_negative') | int }}"
+      - service: select.select_option
+        data:
+          entity_id: select.goodwe_inverter_operation_mode
+          option: "eco_charge"
 
-  # 007 - Negative price charging for use with predbat
+  # 007 - Negative price export control using set_parameter
+  # This automation runs every 5 minutes to catch price changes
   - id: "export_block_negative_price"
     alias: "007 - Block grid export at negative prices"
     description: >
-      Independent of Predbat. Turns on export limit switch when price is
-      negative, turns it off when price returns positive.
-      Runs every 5 minutes to catch price changes promptly.
+      Uses goodwe.set_parameter with grid_export directly.
+      Turns on export (value=1) when price is negative, off (value=0) when positive.
+      Runs every 30 minutes at :30 to catch price changes.
     mode: single
     trigger:
       - platform: time_pattern
-        minutes: "/5"
+        minutes: "30"
+        seconds: "30"
     action:
       - choose:
           - conditions:
@@ -549,10 +555,32 @@ automation:
                 entity_id: binary_sensor.market_price_is_negative
                 state: "on"
             sequence:
-              - service: switch.turn_on
+              - service: logbook.log
                 data:
-                  entity_id: switch.goodwe_grid_export_limit_switch
+                  name: "electricity_price_optimisation"
+                  message: "Blocking grid export due to negative price"
+              - service: goodwe.set_parameter
+                data:
+                  device_id: 32c73405fe89f7c817d30f16c6e2e789
+                  parameter: grid_export
+                  value: 1
+              - service: notify.mobile_app_synology
+                data:
+                  message: >-
+                    Grid export blocked due to negative price ({{ states('sensor.market_price_current_value') }} EUR/kWh)
+                  title: "Export Geblokkeerd"
         default:
-          - service: switch.turn_off
+          - service: logbook.log
             data:
-              entity_id: switch.goodwe_grid_export_limit_switch
+              name: "electricity_price_optimisation"
+              message: "Enabling grid export - price is positive"
+          - service: goodwe.set_parameter
+            data:
+              device_id: 32c73405fe89f7c817d30f16c6e2e789
+              parameter: grid_export
+              value: 0
+          - service: notify.mobile_app_synology
+            data:
+              message: >-
+                Grid export enabled - price is positive ({{ states('sensor.market_price_current_value') }} EUR/kWh)
+              title: "Export Toegestaan"
