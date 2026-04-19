@@ -3,13 +3,15 @@
 #
 # DEVICE ID: 32c73405fe89f7c817d30f16c6e2e789 (GoodWe GW10K-ET inverter)
 #
-# CONTROL MECHANISM — GW10K-ET has two separate selects:
+# CONTROL MECHANISM — GW10K-ET has two separate selects plus a DoD number:
 #   select.goodwe_inverter_operation_mode — high-level mode (general/eco_charge/eco_discharge...)
 #   select.goodwe_ems_mode                — low-level real-time EMS (auto/battery_standby...)
+#   number.goodwe_depth_of_discharge_on_grid — discharge floor (asymmetric, see below)
 #
-#   Charging:      inverter_operation_mode = eco_charge + number.goodwe_eco_mode_soc = target
-#   Battery idle:  inverter_operation_mode = general    + ems_mode = battery_standby
-#   Normal:        inverter_operation_mode = general    + ems_mode = auto
+#   Charging:    inverter_operation_mode = eco_charge + number.goodwe_eco_mode_soc = target
+#   Preserving:  inverter_operation_mode = general + ems_mode = auto + raised DoD floor
+#                (battery_standby is NOT used — it also blocks PV charging, which we don't want)
+#   Normal:      inverter_operation_mode = general + ems_mode = auto + daily DoD
 #
 # EXPORT CONTROL — writes register 47509 directly via goodwe.set_parameter:
 #   grid_export = 1  → export-limit FEATURE ON  → (with grid_export_limit=0W) export blocked
@@ -17,17 +19,27 @@
 #   PREREQUISITE: number.goodwe_grid_export_limit MUST be 0W (enforced by automation 000).
 #
 # STRATEGY:
-#   | Price bucket       | operation_mode | ems_mode        | eco_mode_soc  | grid_export |
-#   |--------------------|----------------|-----------------|---------------|-------------|
-#   | Negative           | eco_charge (*) | auto            | 95%           | 1 (blocked) |
-#   | Bottom 25%, profit | eco_charge     | auto            | dynamic 78–95 | 0 (allowed) |
-#   | Bottom 25%, no edge| general        | battery_standby | —             | 0 (allowed) |
-#   | Middle 25–75%      | general        | battery_standby | —             | 0 (allowed) |
-#   | Top 25%            | general        | auto            | —             | 0 (allowed) |
-#   | SoC ceiling reached| general        | auto            | —             | 0 (unless negative) |
+#   | Price bucket       | operation_mode | ems_mode | eco_mode_soc  | DoD-on-grid | grid_export |
+#   |--------------------|----------------|----------|---------------|-------------|-------------|
+#   | Negative           | eco_charge (*) | auto     | 95%           | daily (91)  | 1 (blocked) |
+#   | Bottom 25%, profit | eco_charge     | auto     | dynamic 78–95 | daily (91)  | 0 (allowed) |
+#   | Bottom 25%, no edge| general        | auto     | —             | preserve 40 | 0 (allowed) |
+#   | Middle 25–75%      | general        | auto     | —             | preserve 40 | 0 (allowed) |
+#   | Top 25%            | general        | auto     | —             | daily (91)  | 0 (allowed) |
+#   | SoC ceiling reached| general        | auto     | —             | daily (91)  | 0 (unless negative) |
 #   (*) only if SoC < 95% — otherwise just block export, leave battery as-is.
 #
-# PEAK SHAVING:
+# PEAK SHAVING via DoD-on-grid (not battery_standby):
+#   battery_standby blocks BOTH charge and discharge — wrong tool, prevents PV from
+#   filling the battery. Instead, 002 raises the discharge floor via
+#   number.goodwe_depth_of_discharge_on_grid (asymmetric: blocks discharge, allows charge).
+#     DoD value = 100 − desired_SoC_floor
+#     Example: DoD = 40 → discharge floor = 60% SoC (6 kWh reserved for evening peak)
+#     Example: DoD = 91 → discharge floor = 9%  SoC (default, full usable range)
+#   During preservation, ems_mode stays `auto` so PV surplus charges the battery normally;
+#   only discharge is gated by the DoD floor. 003 restores DoD to 91 for expensive hours.
+#
+# SOLAR GUARD:
 #   The solar guard in 001 sums solar only up to the NEXT expensive slot, not over the
 #   full forecast horizon. This prevents tomorrow's midday surplus from wrongly blocking
 #   tonight's cheap charge when an expensive morning peak sits in between.
@@ -36,14 +48,14 @@
 #   sensor.dynamic_charge_ceiling scales the charge target (0, 78, 82, 90, 95%) to the
 #   price spread between now and the forecast max, after accounting for round-trip
 #   battery efficiency (~90%). Ceiling=0 means "not profitable to charge" — 002 takes
-#   over and preserves the battery in standby. See input_number.battery_rt_efficiency
+#   over and preserves the battery via DoD floor. See input_number.battery_rt_efficiency
 #   and input_number.min_profitable_spread_* for tunables.
 #
 # AUTOMATIONS:
-#   000 - Enforce grid_export_limit = 0W on HA startup (safety prerequisite)
+#   000 - Startup safety: grid_export_limit = 0W, DoD reset to daily (91)
 #   001 - Cheap price charging: eco_charge to dynamic ceiling, peak-shaving-aware solar guard
-#   002 - Battery preservation: battery_standby during middle hours OR unprofitable cheap hours
-#   003 - Return to normal: general+auto during expensive hours or fallback
+#   002 - Battery preservation: raise DoD floor to 60% during middle hours OR unprofitable cheap hours
+#   003 - Return to normal: general+auto + DoD back to daily during expensive hours or fallback
 #   004 - Periodic price refresh: polls upstream sensor every 5 minutes
 #   005 - SoC guard: returns to general+auto when eco_charge ceiling hit
 #   006 - Negative price charging: eco_charge to 95% ONLY if SoC < ceiling (export via 007)
@@ -112,6 +124,28 @@ input_number:
     min: 0.00
     max: 1.00
     step: 0.01
+
+  # ---- DoD-based preservation tunables ----
+  # During middle-priced hours (and cheap-unprofitable hours), 002 raises the
+  # discharge floor so the battery is reserved for the evening expensive window
+  # but can still charge from PV surplus. Seasonal note: in summer (Belgium,
+  # abundant PV), 60% reserve leaves ~4 kWh headroom for PV → battery, which
+  # fills easily. In winter, consider dropping to 30-40% to capture more scarce PV.
+  preservation_floor_soc:
+    name: Preservation SoC floor during middle hours (%)
+    initial: 60
+    min: 10
+    max: 95
+    step: 1
+  # Daily baseline DoD — value written on startup (000) and when returning
+  # to expensive hours (003). DoD 91 = discharge allowed down to 9% SoC.
+  # Raise to 80-85 in winter if you want a deeper battery reserve across days.
+  daily_dod:
+    name: Daily baseline DoD-on-grid (%)
+    initial: 91
+    min: 10
+    max: 95
+    step: 1
 
 input_boolean:
   electricity_price_test:
@@ -336,14 +370,20 @@ template:
 # =============================================================================
 automation:
   # ---------------------------------------------------------------------------
-  # 000 - Safety: enforce grid_export_limit = 0W at HA startup
+  # 000 - Startup safety: grid_export_limit = 0W AND DoD reset to daily baseline
   # ---------------------------------------------------------------------------
-  # The grid_export toggle (reg 47509) only blocks export when the wattage limit
-  # (reg 47510) is 0W. If the limit is at 5000W, enabling the feature just caps
-  # at 5kW — it doesn't block. Make sure it's 0 after every HA restart.
+  # Two safety preconditions enforced after every HA restart:
+  #   1. number.goodwe_grid_export_limit = 0W — so the grid_export toggle
+  #      (reg 47509) actually blocks export when enabled (see 007).
+  #   2. number.goodwe_depth_of_discharge_on_grid = daily_dod (default 91) —
+  #      ensures the battery discharge floor is at its daily baseline and
+  #      not stuck at some preservation value from before the restart.
   - id: "electricity_price_startup_000"
-    alias: "000 - GoodWe: enforce export limit = 0W on startup"
-    description: "Safety prerequisite for grid_export toggle to actually block export."
+    alias: "000 - GoodWe: startup safety resets (export limit + DoD)"
+    description: >
+      Startup resets: grid_export_limit to 0W (prerequisite for export blocking),
+      and DoD-on-grid to daily baseline (ensures battery isn't stuck with an
+      elevated discharge floor from before the restart).
     mode: single
     trigger:
       - platform: homeassistant
@@ -354,10 +394,17 @@ automation:
         data:
           entity_id: number.goodwe_grid_export_limit
           value: 0
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_depth_of_discharge_on_grid
+          value: "{{ states('input_number.daily_dod') | int }}"
       - service: logbook.log
         data:
           name: "electricity_price_optimisation"
-          message: "Startup: grid_export_limit forced to 0W"
+          message: >-
+            Startup: grid_export_limit=0W,
+            DoD-on-grid={{ states('input_number.daily_dod') | int }}
+            (floor {{ 100 - (states('input_number.daily_dod') | int) }}% SoC)
 
   # ---------------------------------------------------------------------------
   # 001 - Cheap price charging (bottom 25%, not negative)
@@ -449,31 +496,49 @@ automation:
   # 002 - Battery preservation during middle hours (25–75%)
   # ---------------------------------------------------------------------------
   # ---------------------------------------------------------------------------
-  # 002 - Battery preservation (middle hours OR cheap-but-unprofitable hours)
+  # 002 - Battery preservation via DoD floor (middle hours OR unprofitable cheap)
   # ---------------------------------------------------------------------------
-  # battery_standby → battery completely idle, grid covers house load.
-  # Solar still charges battery. Preserves capacity for the expensive window.
+  # Raises the discharge floor via number.goodwe_depth_of_discharge_on_grid so
+  # the battery is reserved for the expensive window, BUT still charges from PV
+  # surplus (unlike battery_standby, which blocks charging too).
+  #
+  # DoD semantics (HA entity convention, inverted from SoC):
+  #   DoD = 100 − floor_SoC
+  #   Example: DoD = 40 → allow discharge down to 60% SoC (reserve 60%)
+  #
+  # ems_mode stays `auto` so:
+  #   - PV surplus → charges battery normally (up to 100% SoC)
+  #   - House load > PV → grid covers, battery held at/above floor
+  #   - House load < PV → PV covers load AND charges battery
   #
   # Fires when EITHER:
   #   (a) price is middle 25–75% (neither cheap nor expensive), OR
   #   (b) price IS cheap (bottom 25%) BUT dynamic_charge_ceiling == 0
   #       (arbitrage spread doesn't cover round-trip losses + margin)
   # Negative prices are excluded (handled by 006).
+  #
+  # Triggers on both the hourly :00:30 AND on state changes of the price buckets,
+  # so transitions into a preservation window happen promptly (no up-to-1-minute gap).
   - id: "electricity_price_preserve_002"
-    alias: "002 - GoodWe battery preservation - battery_standby"
+    alias: "002 - GoodWe battery preservation via DoD floor"
     description: >
-      Hourly: middle-priced hours OR cheap hours where charging isn't profitable
-      → general + battery_standby. Preserves battery for the coming expensive window.
+      Raises DoD floor during middle-priced hours or cheap-unprofitable hours.
+      Battery preserved for evening peak but still charges from PV surplus.
     mode: single
     trigger:
       - platform: time_pattern
         hours: "/1"
         minutes: "0"
         seconds: "30"
+      - platform: state
+        entity_id:
+          - binary_sensor.market_should_charge_bottom_25
+          - binary_sensor.market_should_discharge_top_25
+          - binary_sensor.market_price_is_negative
     condition:
       - condition: template
-        # Excludes expensive and negative regardless. Includes middle hours OR
-        # cheap-but-unprofitable hours (dynamic ceiling == 0).
+        # Includes middle-priced hours OR cheap-but-unprofitable hours.
+        # Excludes expensive and negative regardless.
         value_template: >-
           {% set is_cheap = is_state('binary_sensor.market_should_charge_bottom_25','on') %}
           {% set is_expensive = is_state('binary_sensor.market_should_discharge_top_25','on') %}
@@ -492,6 +557,9 @@ automation:
                or is_state('input_boolean.electricity_price_test','on') }}
           {% endif %}
     action:
+      - variables:
+          floor: "{{ states('input_number.preservation_floor_soc') | int(60) }}"
+          dod: "{{ 100 - (states('input_number.preservation_floor_soc') | int(60)) }}"
       - service: logbook.log
         data:
           name: "electricity_price_optimisation"
@@ -501,7 +569,10 @@ automation:
             {% set is_cheap = is_state('binary_sensor.market_should_charge_bottom_25','on') %}
             {% set ceiling = states('sensor.dynamic_charge_ceiling') | int(0) %}
             {% set reason = 'cheap-but-unprofitable' if (is_cheap and ceiling == 0) else 'middle-price' %}
-            Preservation ({{ reason }}): battery_standby. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+            Preservation ({{ reason }}): DoD={{ dod }} (floor {{ floor }}% SoC).
+            Price {{ price }} EUR/kWh, SoC {{ soc }}%
+      # Ensure inverter is in general+auto so PV charging works normally.
+      # (Idempotent — safe to write even if already set.)
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
@@ -509,22 +580,36 @@ automation:
       - service: select.select_option
         data:
           entity_id: select.goodwe_ems_mode
-          option: "battery_standby"
+          option: "auto"
+      # Raise the discharge floor. This is the actual preservation mechanism.
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_depth_of_discharge_on_grid
+          value: "{{ dod }}"
 
   # ---------------------------------------------------------------------------
   # 003 - Return to normal (expensive hours or fallback)
   # ---------------------------------------------------------------------------
-  # Top 25% → general + auto, battery naturally discharges to cover house load.
+  # Top 25% → general + auto + DoD restored to daily baseline, so battery
+  # freely discharges to cover house load during expensive hours.
   # Also fallback when price data is unavailable. Never fires during negative prices.
+  #
+  # Triggers on both the hourly :00:30 AND on the binary_sensor transitioning
+  # to 'on', so the DoD is restored the moment expensive hours start — no gap
+  # where the preservation floor is still in effect during peak pricing.
   - id: "electricity_price_auto_003"
     alias: "003 - GoodWe return to normal - expensive hours or fallback"
-    description: "Hourly: top 25% price or no price data → general + auto."
+    description: >
+      Top 25% price or no price data → general + auto + DoD restored to daily baseline.
     mode: single
     trigger:
       - platform: time_pattern
         hours: "/1"
         minutes: "0"
         seconds: "30"
+      - platform: state
+        entity_id: binary_sensor.market_should_discharge_top_25
+        to: "on"
     condition:
       - condition: template
         value_template: >-
@@ -540,7 +625,9 @@ automation:
           message: >-
             {% set soc = states('sensor.goodwe_battery_state_of_charge') | float(0) %}
             {% set price = states('sensor.market_price_current_value') %}
-            Normal mode: expensive or fallback. Price {{ price }} EUR/kWh, SoC {{ soc }}%
+            {% set dod = states('input_number.daily_dod') | int(91) %}
+            Normal mode: expensive or fallback. Price {{ price }} EUR/kWh,
+            SoC {{ soc }}%, DoD restored to {{ dod }} (floor {{ 100 - dod }}%)
       - service: select.select_option
         data:
           entity_id: select.goodwe_inverter_operation_mode
@@ -549,6 +636,11 @@ automation:
         data:
           entity_id: select.goodwe_ems_mode
           option: "auto"
+      # Restore DoD to daily baseline so battery can discharge normally during peak.
+      - service: number.set_value
+        data:
+          entity_id: number.goodwe_depth_of_discharge_on_grid
+          value: "{{ states('input_number.daily_dod') | int(91) }}"
 
   # ---------------------------------------------------------------------------
   # 004 - Periodic price refresh
