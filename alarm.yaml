@@ -37,7 +37,7 @@ automation:
   # ── ARM: enable Frigate detection + recording ──────────────────────────────
   - id: alarm_on_arm
     alias: "Alarm | Enable Frigate detection on arm"
-    description: "Turns on person detection and recording when alarm is armed"
+    description: "Enables person detection and recording when alarm is armed"
     trigger:
       - platform: state
         entity_id: alarm_control_panel.home_alarm
@@ -45,18 +45,26 @@ automation:
           - armed_away
           - armed_home
     action:
-      - action: switch.turn_on
-        target:
-          entity_id:
-            - switch.terrace_detect # frigate integration (not dahua!)
-            - switch.terrace_motion
-            - switch.back_garden_detect
-            - switch.back_garden_motion
-      - action: switch.turn_on
-        target:
-          entity_id:
-            - switch.terrace_recordings
-            - switch.back_garden_recordings
+      - action: mqtt.publish
+        data:
+          topic: "frigate/terrace/detection/set"
+          payload: "ON"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/terrace/record/set"
+          payload: "ON"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/back_garden/detection/set"
+          payload: "ON"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/back_garden/record/set"
+          payload: "ON"
+          qos: 1
 
   # ── DISARM: disable detection + stop all alarm responses ──────────────────
   - id: alarm_on_disarm
@@ -66,18 +74,26 @@ automation:
         entity_id: alarm_control_panel.home_alarm
         to: disarmed
     action:
-      - action: switch.turn_off
-        target:
-          entity_id:
-            - switch.terrace_detect # frigate integration (not dahua!)
-            - switch.terrace_motion
-            - switch.back_garden_detect
-            - switch.back_garden_motion
-      - action: switch.turn_off
-        target:
-          entity_id:
-            - switch.terrace_recordings
-            - switch.back_garden_recordings
+      - action: mqtt.publish
+        data:
+          topic: "frigate/terrace/detection/set"
+          payload: "OFF"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/terrace/record/set"
+          payload: "OFF"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/back_garden/detection/set"
+          payload: "OFF"
+          qos: 1
+      - action: mqtt.publish
+        data:
+          topic: "frigate/back_garden/record/set"
+          payload: "OFF"
+          qos: 1
       - action: switch.turn_off
         target:
           entity_id:
