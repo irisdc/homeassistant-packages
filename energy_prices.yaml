@@ -9,14 +9,6 @@ utility_meter:
     cycle: daily
 
 input_number:
-  frank_gasprijs:
-    name: "Frank gasprijs €/kWh"
-    min: 0
-    max: 1
-    step: 0.0001
-    unit_of_measurement: "€/kWh"
-    icon: mdi:currency-eur
-
   frank_vaste_kost_per_dag:
     name: "Frank vaste kost per dag"
     min: 0
@@ -32,21 +24,20 @@ template:
         icon: mdi:cash
         state: >
           {% set verbruik = states('sensor.gas_daily') | float(0) %}
-          {% set prijs = states('input_number.frank_gasprijs') | float(0) %}
+          {% set prijs = states('sensor.current_gas_price_all_in') | float(0) %}
           {% set vaste = states('input_number.frank_vaste_kost_per_dag') | float(0) %}
           {{ (verbruik * prijs + vaste) | round(2) }}
 
-automation:
-  - alias: "Herinnering gasprijs Frank updaten"
-    id: herinnering_gasprijs_frank
-    trigger:
-      - platform: time
-        at: "09:00:00"
-    condition:
-      - condition: template
-        value_template: "{{ now().day == 1 }}"
-    action:
-      - service: notify.mobile_app_iris
-        data:
-          title: "Gasprijs updaten"
-          message: "Nieuwe maand → update je Frank gasprijs in het Energy Dashboard."
+      - name: "Electriciteit dagkost"
+        unit_of_measurement: "€"
+        icon: mdi:flash
+        state: >
+          {% set import_kwh = states('sensor.goodwe_today_energy_import') | float(0) %}
+          {% set export_kwh = states('sensor.goodwe_today_energy_export') | float(0) %}
+          {% set prices = state_attr('sensor.current_electricity_price_all_in', 'prices') %}
+          {% set avg_import = prices | map(attribute='price') | average | default(0) %}
+          {% set market_prices = state_attr('sensor.current_electricity_market_price', 'prices') %}
+          {% set avg_market = market_prices | map(attribute='price') | average | default(0) %}
+          {% set import_cost = import_kwh * avg_import %}
+          {% set export_credit = export_kwh * avg_market %}
+          {{ (import_cost - export_credit) | round(2) }}

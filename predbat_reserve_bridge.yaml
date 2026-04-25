@@ -1,0 +1,88 @@
+# packages/predbat_reserve_bridge.yaml
+#
+# Bridge between Predbat's reserve semantics (SoC% to preserve) and GoodWe's
+# DoD-on-grid semantics (% of battery allowed to discharge from full).
+#
+# Predbat writes: "reserve 30%" meaning "don't discharge below 30% SoC"
+# GoodWe wants:   DoD = 100 − 30 = 70
+#
+# Predbat writes to number.predbat_reserve_soc_to_dod as an SoC%; this
+# template number stores it locally AND writes the inverted value to the
+# actual inverter DoD entity as a side effect.
+#
+# ------------------------------------------------------------------
+# IMPORTANT: input_number.predbat_reserve_soc holds the last value Predbat
+# wrote to us. The template number reads from it for state and writes back
+# on set_value, triggering an automation that writes to the real DoD entity.
+# ------------------------------------------------------------------
+
+input_number:
+  predbat_reserve_soc:
+    name: "Predbat reserve SoC (internal)"
+    min: 0
+    max: 100
+    step: 1
+    initial: 10
+    unit_of_measurement: "%"
+
+template:
+  - number:
+      - name: "Predbat reserve SoC to DoD"
+        unique_id: predbat_reserve_soc_to_dod
+        unit_of_measurement: "%"
+        min: 0
+        max: 100
+        step: 1
+        state: "{{ states('input_number.predbat_reserve_soc') | int(10) }}"
+        set_value:
+          - service: input_number.set_value
+            data:
+              entity_id: input_number.predbat_reserve_soc
+              value: "{{ value }}"
+          # Convert SoC-reserve → DoD and write to real GoodWe entity.
+          # Clamp to [0, 95] to avoid pathological values.
+          - service: number.set_value
+            data:
+              entity_id: number.goodwe_depth_of_discharge_on_grid
+              value: >-
+                {% set dod = 100 - (value | int(10)) %}
+                {{ [0, [95, dod] | min] | max }}
+
+automation:
+  # Safety: if HA automation 002 (preservation) is also running and writing
+  # the DoD entity, we could have a race. In MODE A (Predbat in control),
+  # 002 should be disabled, so this shouldn't happen. But as a guard, this
+  # automation logs any conflict it detects — DoD was written recently by
+  # Predbat's reserve AND 002 also fired.
+  #
+  # Comment out this automation entirely if you're certain 002 is disabled
+  # in MODE A and you don't need the observability.
+  - id: "predbat_reserve_conflict_watchdog"
+    alias: "Predbat reserve / 002 conflict watchdog"
+    description: >
+      Logs when number.goodwe_depth_of_discharge_on_grid is changed by
+      someone other than Predbat's reserve bridge. Useful during the
+      Mode A cutover to catch forgotten automations.
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: number.goodwe_depth_of_discharge_on_grid
+    condition:
+      # Only log if the change didn't come from Predbat's reserve bridge.
+      # The bridge sets this entity; if another caller changes it while
+      # Predbat is in control, it's worth knowing.
+      - condition: template
+        value_template: >-
+          {% set our_soc_reserve = states('input_number.predbat_reserve_soc') | int(10) %}
+          {% set expected_dod = 100 - our_soc_reserve %}
+          {% set actual_dod = states('number.goodwe_depth_of_discharge_on_grid') | int(91) %}
+          {{ (expected_dod - actual_dod) | abs > 2 }}
+    action:
+      - service: logbook.log
+        data:
+          name: "predbat_reserve_bridge"
+          message: >-
+            DoD drift detected: expected {{ 100 - (states('input_number.predbat_reserve_soc') | int(10)) }},
+            got {{ states('number.goodwe_depth_of_discharge_on_grid') }}.
+            Someone else wrote to DoD — check HA automation 002 is disabled in MODE A.
